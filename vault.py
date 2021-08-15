@@ -87,5 +87,3 @@ def test():
     print(vault)
     loaded_vault = loadVault('test.vault')  # reads contents of 'test.vault' into a new vault
     print(readAll(loaded_vault, 'password'))  # prints all data entries of the new vault - password required, uses private key to decrypt
-
-test()
