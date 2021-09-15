@@ -81,7 +81,7 @@ def readAll(vault: Vault, password: str):
 
 
 def test():
-    vault = newVault('test', 'password')  # creates a new vault 'test' with password 'helloworld'
+    vault = newVault('test', 'password')  # creates a new vault 'test' with password 'password'
     storeItem(vault, 'hello world!')  # writes 'hello world!!' as a data entry in the vault - no password required, uses public key
     dumpVault(vault)  # dumps the vault to 'test.vault' - base64 encoded json
     print(vault)
