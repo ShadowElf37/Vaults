@@ -69,9 +69,7 @@ class Vault:
             raise ValueError('Vault is locked. Please call vault.unlock()')
         return AES.new(self.true_key_decrypted, mode=AES.MODE_CBC, iv=iv)
     def __encrypt(self, data: bytes, iv: bytes, n_times=N_ENCRYPT):
-        print('before pad', data[-32:])
         data = pad(data, AES.block_size)
-        print('after pad', data[-32:])
         for _ in range(n_times):
             cipher = self.__init_cipher(iv)
             data = cipher.encrypt(data)
@@ -80,7 +78,6 @@ class Vault:
         for _ in range(n_times):
             cipher = self.__init_cipher(iv)
             data = cipher.decrypt(data)
-        print('decrypted', data[-32:])
         return unpad(data, AES.block_size)
 
     def __make_entry(self, data: bytes, name: str = 'Unnamed Data'):
@@ -193,10 +190,9 @@ def test():
     vault = Vault('test', 'password')  # creates a new vault 'test' with password 'password'
     vault.store_item('hello world!')  # writes 'hello world!' as a data entry in the vault - no password required, uses public key
     vault.store_file('sus_image.png')  # writes a whole file into the vault - no maximum size, as it is broken up into blocks
-    vault.dump(overwrite=True)  # dumps the vault to 'test.vault' using pickle
+    vault.dump()  # dumps the vault to 'test.vault' using pickle
     print(vault.ls())  # displays a summary of the vault content
     loaded_vault = Vault.from_file('test.vault', 'password')  # reads contents of 'test.vault' into a new vault
-    loaded_vault.read_item(0)
     loaded_vault.disp_image(1)  # prints all data entries of the new vault - password required, uses private key to decrypt
 
 if __name__ == "__main__":
