@@ -79,15 +79,19 @@ class Vault:
         cipher = self.__cipher.renew(self.__record_nonce)
         while True:
             data = self.buffer.read(Record.SIZE)
+            data = cipher.decrypt(data)
             if not any(data):
                 break
-            data = cipher.decrypt(data)
             self.records.append(Record.load(data))
     def __dump_record_table(self):
         cipher = self.__cipher.renew(self.__record_nonce)
         self.buffer.seek(12)
-        for i, rec in enumerate(self.records):
-            self.buffer.write(cipher.encrypt(rec.dump()))
+        zeros = bytes(Record.SIZE)
+        for i in range(self.max_entries):
+            if i < self.count:
+                self.buffer.write(cipher.encrypt(self.records[i].dump()))
+            else:
+                self.buffer.write(cipher.encrypt(zeros))
 
     def __write_raw(self, data: bytes):
         self.buffer.seek(self.__data_start + self.data_size)
