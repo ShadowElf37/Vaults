@@ -1,129 +1,146 @@
-from Crypto.PublicKey import RSA
-from Crypto.Cipher import PKCS1_OAEP, Salsa20, AES
-from Crypto.Random import get_random_bytes
-from Crypto.Util.Padding import pad, unpad
-from typing import Union, Iterable
-from os.path import exists
-import os.path
-import pickle
+import os
+import struct
 import io
-
+import ciphers
+from typing import BinaryIO
 try:
     import cv2
     import numpy as np
     USE_CV = True
 except ImportError:
     USE_CV = False
-    print('Could not find opencv-python. Image and video capability will be limited.')
 
-class Vault:
-    SALT = b'\xad]:\xbf\xcd\xfd\x92\xe2\xe0w\x18\xc0\xf0\x98\xff-\x99J}4\\\x13?Dbd\xb8Wh\xe4\x00H'
-    N_ENCRYPT = 3
-    N_KEY_ENCRYPT = 20
+ENCODING = 'utf-8'
 
-    STORE_FIELDS = ('name', 'true_key', 'data')
+class Record:
+    """
+    [64 bytes] name
+    [12 bytes] data nonce
+    [8 bytes] data size
+    [8 bytes] data ptr
 
-    def __init__(self, name: str, password: str):
-        self.true_key_decrypted = get_random_bytes(32)
-        self.true_key = self.true_key_decrypted
-        pwd_cipher = AES.new((password.encode() + self.SALT)[:32], mode=AES.MODE_ECB)
-        for i in range(self.N_KEY_ENCRYPT):
-            self.true_key = pwd_cipher.encrypt(self.true_key)
+    total: 92 bytes per Record
+    """
 
+    FMT = '<64s12sQQ'
+    SIZE = struct.calcsize(FMT)
+
+    def __init__(self, name, nonce, data_size, data_ptr):
         self.name = name
-        self.data: [dict] = []
+        self.nonce = nonce
+        self.data_size = data_size
+        self.data_ptr = data_ptr
 
     def __repr__(self):
-        return '<Vault %s: %d entries>' % (self.name, len(self.data))
+        return str((self.name, self.nonce, self.data_size, self.data_ptr))
 
     @staticmethod
-    def copy(old_vault, new_vault, old_password: str):
-        """
-        Copies contents of old_vault into new_vault, without replacing new_vault data.
-        Useful if updates to Vault or key generation are made, or you want to change your password.
-        """
-        new_vault.store_all(old_vault.read_all(old_password))
+    def load(buffer: bytes):
+        return Record(*struct.unpack(Record.FMT, buffer))
+    def dump(self) -> bytes:
+        return struct.pack(Record.FMT, self.name, self.nonce, self.data_size, self.data_ptr)
+
+
+class Vault:
+    MAX_ENTRIES = 128
+
     @staticmethod
-    def from_file(fp: str, password: str):
-        """
-        Load vault from file
-        """
-        with open(fp, 'rb') as file:
-            vault_dict = pickle.load(file)
-            vault = Vault.__new__(Vault)
-            vault.__dict__.update(vault_dict)
-            vault.unlock(password)
-        return vault
+    def new(password: str, buffer: BinaryIO = io.BytesIO()):
+        v = Vault(password, buffer, Vault.MAX_ENTRIES)
+        buffer.write(v.__record_nonce)
+        buffer.write(bytes(Vault.MAX_ENTRIES*Record.SIZE))
+        return v
 
-    def unlock(self, password: str):
-        pwd = (password.encode() + self.SALT)[:32]
-        pwd_cipher = AES.new(pwd, mode=AES.MODE_ECB)
-        self.true_key_decrypted = self.true_key
-        for i in range(self.N_KEY_ENCRYPT):
-            self.true_key_decrypted = pwd_cipher.decrypt(self.true_key_decrypted)
-    def lock(self):
-        self.true_key_decrypted = None
+    @staticmethod
+    def from_file(buffer: BinaryIO, password: str):
+        v = Vault(password, buffer, Vault.MAX_ENTRIES)
+        v.__load_record_table()
+        return v
 
-    def __init_cipher(self, iv: bytes):
-        if not self.true_key_decrypted:
-            raise ValueError('Vault is locked. Please call vault.unlock()')
-        return AES.new(self.true_key_decrypted, mode=AES.MODE_CBC, iv=iv)
-    def __encrypt(self, data: bytes, iv: bytes, n_times=N_ENCRYPT):
-        data = pad(data, AES.block_size)
-        for _ in range(n_times):
-            cipher = self.__init_cipher(iv)
-            data = cipher.encrypt(data)
-        return data
-    def __decrypt(self, data: bytes, iv: bytes, n_times=N_ENCRYPT):
-        for _ in range(n_times):
-            cipher = self.__init_cipher(iv)
+    def __init__(self, password: str, buffer: BinaryIO, max_entries):
+        if not (buffer.readable() and buffer.writable()):
+            raise IOError('Buffer must have read/write perms')
+
+        self.__record_nonce = os.urandom(12)
+        self.records: [Record] = []
+        self.max_entries = Vault.MAX_ENTRIES
+        self.__data_start = self.max_entries * Record.SIZE + 12
+        self.buffer = buffer
+        self.__cipher = ciphers.CipherGenerator(password)
+
+    def __enter__(self, *args):
+        pass
+    def __exit__(self, *args):
+        self.buffer.close()
+
+    def __load_record_table(self):
+        self.buffer.seek(0)
+        self.__record_nonce = self.buffer.read(12)
+        cipher = self.__cipher.renew(self.__record_nonce)
+        while True:
+            data = self.buffer.read(Record.SIZE)
+            if not any(data):
+                break
             data = cipher.decrypt(data)
-        return unpad(data, AES.block_size)
+            self.records.append(Record.load(data))
+    def __dump_record_table(self):
+        cipher = self.__cipher.renew(self.__record_nonce)
+        self.buffer.seek(12)
+        for i, rec in enumerate(self.records):
+            self.buffer.write(cipher.encrypt(rec.dump()))
 
-    def __make_entry(self, data: bytes, name: str = 'Unnamed Data'):
-        iv = get_random_bytes(16)
-        return {'name': name, 'data': self.__encrypt(data, iv), 'iv': iv}
-
-    if USE_CV:
-        def disp_image(self, index: int):
-            """
-            This method displays an image without ever saving it decrypted to a file
-            """
-            imdata = np.frombuffer(self.read_item(index), dtype=np.uint8)
-            img = cv2.imdecode(imdata, cv2.IMREAD_UNCHANGED)
-            fname = self.data[index]['name']
-            cv2.imshow(f'vault_display_{fname}', img)
-            cv2.setWindowTitle(f'vault_display_{fname}', fname)
-            print('Displaying image. Press any key to exit.')
-            cv2.waitKey(0)
-            cv2.destroyAllWindows()
-
-        # not functional
+    def __write_raw(self, data: bytes):
+        self.buffer.seek(self.__data_start + self.data_size)
+        self.buffer.write(data)
+    def __chunk_read_raw(self, rec: Record, chunk_size=1024) -> bytes:
+        for i in range(0, rec.data_size, chunk_size):
+            self.buffer.seek(self.__data_start + rec.data_ptr + i)
+            yield self.buffer.read(min(chunk_size, rec.data_size - i))
+    def read_chunks(self, index: int, chunk_size=1024) -> bytes:
         """
-        def disp_video(self, password: str, index: int):
-            ""
-            This method displays a video without ever saving it decrypted to a file
-            ""
-            video_data = np.frombuffer(self.read_item(password, index), dtype=np.uint8)
-            video_stream = cv2.imdecode(video_data, cv2.IMREAD_UNCHANGED)
-            fname = self.data_names[index]
-            cv2.setWindowTitle(f'vault_display_{fname}', fname)
-            print('Displaying image. Press any key to exit.')
-            while True:
-                for frame in video_stream:
-                    cv2.imshow(f'vault_display_{fname}', frame)
-                    if cv2.waitKey(1000//60) != -1:
-                        cv2.destroyAllWindows()
-                        return
+        Generator that returns chunks of data from a file index
         """
+        rec = self.records[index]
+        cipher = self.__cipher.renew(rec.nonce)
+        for chunk in self.__chunk_read_raw(rec, chunk_size):
+            yield cipher.decrypt(chunk)
+
+    @property
+    def data_size(self):
+        """
+        Total bytes of data only
+        """
+        return sum(rec.data_size for rec in self.records)
+    @property
+    def count(self):
+        """
+        Number of entries
+        """
+        return len(self.records)
 
     def ls(self):
-        return f'Vault "{self.name}"\n' + '\n'.join(('\t%d - ' % i) + entry['name'] for i, entry in enumerate(self.data))
+        """
+        Return a nice summary of the vault contents
+        """
+        return ('Vault with %d entries (%.1f kB):' % (self.count, (self.__data_start + self.data_size) / 1000)) + ''.join(
+            ['\n%d\t• %s  (%d B)' % (i, rec.name.decode(ENCODING), rec.data_size) for i, rec in enumerate(self.records)]
+        ) + '\n'
 
-    def rename_vault(self, name):
-        self.name = name
-    def rename_item(self, index, name):
-        self.data[index]['name'] = name
+    def store_item(self, data: str | bytes, name='Unnamed Data'):
+        """
+        Main function for writing data, encrypted
+        """
+        if type(name) is str:
+            name = name.encode(ENCODING)
+        if type(data) is str:
+            data = data.encode(ENCODING)
+
+        rec = Record(name, os.urandom(12), len(data), self.data_size)
+        cipher = self.__cipher.renew(rec.nonce)
+        self.__write_raw(cipher.encrypt(data))
+
+        self.records.append(rec)
+        self.__dump_record_table()
 
     def store_file(self, fp:str):
         """
@@ -131,69 +148,60 @@ class Vault:
         """
         self.store_item(open(fp, 'rb').read(), os.path.split(fp)[-1])
 
-    def export_item_into_file(self, index: int, fp: str):
+    def read_item(self, index: int):
+        """
+        Main function for reading data, decrypted
+        """
+
+        rec = self.records[index]
+        self.buffer.seek(self.__data_start + rec.data_ptr)
+        cipher = self.__cipher.renew(rec.nonce)
+        return cipher.decrypt(self.buffer.read(rec.data_size))
+
+    def read_all(self):
+        """
+        Reads everything from vault, decrypted.
+        """
+        return [self.read_item(i) for i in range(self.count)]
+
+    def write_item_to_file(self, index: int, fp: str):
         """
         Exports an item, DECRYPTED
         """
         with open(fp, 'wb') as f:
             f.write(self.read_item(index))
 
-    def store_item(self, data: Union[bytes, str], name='Unnamed Data'):
-        """
-        Stores an item in the vault. Doesn't require password! Encrypts immediately.
-        """
-        print('Encrypting %.1f kB...' % (len(data)/1000))
-        if type(data) is str:
-            data = data.encode()
-        self.data.append(self.__make_entry(data, name))
+    def close(self):
+        self.buffer.close()
 
-    def store_all(self, data: Iterable[Union[bytes, str]], names=()):
-        """
-        Store multiple items at once.
-        """
-        for i, item in enumerate(data):
-            if names:
-                self.store_item(item, names[i])
-            else:
-                self.store_item(item)
+    if USE_CV:
+        def disp_image(self, index: int):
+            """
+            Displays an image without saving it to a file
+            """
+            imdata = np.frombuffer(self.read_item(index), dtype=np.uint8)
+            img = cv2.imdecode(imdata, cv2.IMREAD_UNCHANGED)
+            fname = self.records[index].name.decode(ENCODING)
+            cv2.imshow(f'vault_display_{fname}', img)
+            cv2.setWindowTitle(f'vault_display_{fname}', fname)
+            print('Displaying image. Press any key to exit.')
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
 
-    def read_item(self, index: int):
-        """
-        Reads item from vault and decrypts.
-        """
-        if len(self.data[index]) > 1024:
-            print('Decrypting large item. This may take a while... ', end='')
-        entry = self.data[index]
-        dec = self.__decrypt(entry['data'], entry['iv'])
-        return dec
-
-    def read_all(self):
-        """
-        Reads everything from vault, decrypted.
-        """
-        return [self.read_item(i) for i in range(len(self.data))]
-
-    def dump(self, overwrite=False):
-        """
-        Dump to file
-        """
-        fname = self.name + '.vault'
-        if exists(fname) and not overwrite:
-            answer = input('WARNING: a vault named \'%s\' already exists. Overwrite it? (y/n): ' % self.name)
-            if answer[0].lower() != 'y':
-                return
-        with open(fname, 'wb') as file:
-            pickle.dump({k:self.__dict__[k] for k in self.STORE_FIELDS}, file)
+        def disp_video(self, index: int):
+            """
+            Displays a video without saving it to a file
+            """
 
 
-def test():
-    vault = Vault('test', 'password')  # creates a new vault 'test' with password 'password'
-    vault.store_item('hello world!')  # writes 'hello world!' as a data entry in the vault - no password required, uses public key
-    vault.store_file('sus_image.png')  # writes a whole file into the vault - no maximum size, as it is broken up into blocks
-    vault.dump()  # dumps the vault to 'test.vault' using pickle
-    print(vault.ls())  # displays a summary of the vault content
-    loaded_vault = Vault.from_file('test.vault', 'password')  # reads contents of 'test.vault' into a new vault
-    loaded_vault.disp_image(1)  # prints all data entries of the new vault - password required, uses private key to decrypt
+if __name__ == '__main__':
+    file = open('test.vault2', 'rb+')
 
-if __name__ == "__main__":
-    test()
+    v = Vault.new('password', file)
+    v.store_item(b'secret sauce')
+    v.store_file('sus_image.png')
+    print(v.ls())
+    v.close()
+    v = Vault.from_file(open('test.vault2', 'rb+'), 'password')
+    v.disp_image(1)
+    v.close()
