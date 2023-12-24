@@ -1,6 +1,7 @@
 from Crypto.Cipher import ChaCha20
 from Crypto.Hash import SHA3_256
 from os import urandom
+from random import random
 
 ENCODING = 'utf-8'
 
