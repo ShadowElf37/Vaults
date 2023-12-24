@@ -2,18 +2,27 @@ import os
 import struct
 import io
 import ciphers
-from typing import BinaryIO
+from typing import BinaryIO, Generator, Iterable
 import datetime
 import time
+import shutil
 try:
     import cv2
     import numpy as np
-    import video
     USE_CV = True
 except ImportError:
+    print('WARNING: You are missing either opencv-python or numpy. Cannot display images directly. You can always manually store and load the file.')
     USE_CV = False
 
+if shutil.which('ffmpeg') and shutil.which('ffplay'):
+    import video
+    USE_FFMPEG = True
+else:
+    print('WARNING: You are missing either ffmpeg or ffplay. Cannot store/display videos directly. You can always manually store and load the file.')
+    USE_FFMPEG = False
+
 ENCODING = 'utf-8'
+
 
 class Record:
     """
@@ -63,25 +72,35 @@ class Record:
 
 class Vault:
     """
-    Data:
     [Record] [Data]
     """
 
     @staticmethod
-    def new(password: str, fp: str):
-        buffer = open(fp, 'wb+')
-        return Vault(password, buffer)
+    def new(fp: str, password: str):
+        """
+        Make new vault at fp
+        """
+        return Vault(password, open(fp, 'wb+'))
 
     @staticmethod
     def from_buffer(buffer: BinaryIO, password: str):
+        """
+        Read vault from any buffer
+        """
         v = Vault(password, buffer)
         v.__load_record_table()
         return v
     @staticmethod
     def from_file(fp: str, password: str):
+        """
+        Open vault file
+        """
         return Vault.from_buffer(open(fp, 'rb+'), password)
 
     def __init__(self, password: str, buffer: BinaryIO = io.BytesIO()):
+        """
+        Creates a vault and writes data to buffer
+        """
         if not (buffer.readable() and buffer.writable()):
             raise IOError('Buffer must have read/write perms')
 
@@ -92,8 +111,7 @@ class Vault:
     def __enter__(self, *args):
         pass
     def __exit__(self, *args):
-        self.buffer.close()
-        self.__cipher = None
+        self.close()
 
     def __load_record_table(self):
         self.buffer.seek(0)
@@ -106,7 +124,7 @@ class Vault:
         for i in range(0, rec.data_size, chunk_size):
             self.buffer.seek(rec.data_ptr + i)
             yield self.buffer.read(min(chunk_size, rec.data_size - i))
-    def read_chunks(self, index: int, chunk_size=1024) -> bytes:
+    def read_chunks(self, index: int, chunk_size=1024) -> Generator[bytes, None, None]:
         """
         Generator that returns chunks of data from a file index
         """
@@ -135,14 +153,18 @@ class Vault:
         return len(self.records)
     @property
     def buffer_end(self):
+        """
+        Get pointer to end of current records and data
+        """
         return self.count * Record.FULL_SIZE + self.data_size
 
     def ls(self):
         """
         Return a nice summary of the vault contents
         """
+        #print(self.records)
         return ('Vault with %d entries (%.1f kB):' % (self.count, (self.record_size + self.data_size) / 1000)) + ''.join(
-            ['\n%d\t• %s  (%d B) (%s)' % (i, rec.name.decode(ENCODING), rec.data_size, rec.dt) for i, rec in enumerate(self.records)]
+            ['\n%d\t• %s (%d B) (%s)' % (i, rec.name.decode(ENCODING), rec.data_size, rec.dt) for i, rec in enumerate(self.records)]
         ) + '\n'
 
     def store_item(self, data: str | bytes, name='Unnamed Data'):
@@ -157,6 +179,7 @@ class Vault:
         rec = Record(os.urandom(12), os.urandom(12), name, len(data), time.time())
         self.buffer.seek(self.buffer_end)
         self.buffer.write(rec.dump(self.__cipher))
+        self.buffer.flush()
         rec.data_ptr = self.buffer.tell()
         self.records.append(rec)
 
@@ -182,6 +205,7 @@ class Vault:
         rec = Record(os.urandom(12), nonce, name, bytes_written, time.time())
         self.buffer.seek(record_start)
         self.buffer.write(rec.dump(self.__cipher))
+        self.buffer.flush()
         rec.data_ptr = record_start+Record.FULL_SIZE
         self.records.append(rec)
 
@@ -211,7 +235,7 @@ class Vault:
 
     def export_item_to_file(self, index: int, fp: str):
         """
-        Exports an item, DECRYPTED
+        Exports an item to file, DECRYPTED
         """
         print('Exporting %.1f MB...' % (self.records[index].data_size/1000000), end=' ')
         with open(fp, 'wb') as f:
@@ -221,6 +245,7 @@ class Vault:
 
     def close(self):
         self.buffer.close()
+        self.__cipher = None
 
     if USE_CV:
         def disp_image(self, index: int):
@@ -236,17 +261,25 @@ class Vault:
             cv2.waitKey(0)
             cv2.destroyAllWindows()
 
-        def store_streamable_video(self, fp: str):
+    if USE_FFMPEG:
+        def store_streamable_video(self, fp: str, codec='libx265', preset='medium', crf='23', *ffmpeg_flags):
+            """
+            Stores an arbitrary video file in mkv format
+
+            codec: recommend to use 'libx264' or 'libx265'
+            preset: compression speed, choose the slowest you have patience for (ultrafast superfast veryfast faster fast medium slow slower veryslow)
+            crf: determines video quality, 0 is lossless and 51 is terrible
+            """
             t = time.time()
-            print('Storing video (%.1f MB), this may take a while...' % (os.path.getsize(fp)/1000000), end='')
+            print('Storing video (%.1f MB), this may take a while. Please see video_write.log for details.' % (os.path.getsize(fp)/1000000))
             name = os.path.split(fp)[-1]
             record_start = self.buffer_end
 
             nonce = os.urandom(12)
             cipher = self.__cipher.renew(nonce)
             self.buffer.seek(record_start + Record.FULL_SIZE)
-            bytes_written = video.stream_h264_into_buffer(fp, lambda data: self.buffer.write(cipher.encrypt(data)))
-            print('done in %.1f! (-> %.1f MB)' % (time.time()-t, bytes_written/1000000))
+            bytes_written = video.stream_video_into_buffer(fp, lambda data: self.buffer.write(cipher.encrypt(data)), codec=codec, preset=preset, crf=crf, *ffmpeg_flags)
+            print('Done in %.1fs! (-> %.1f MB)' % (time.time()-t, bytes_written/1000000))
 
             rec = Record(os.urandom(12), nonce, name.encode(ENCODING), bytes_written, time.time())
             self.buffer.seek(record_start)
@@ -258,11 +291,24 @@ class Vault:
             """
             Displays a video without saving it to a file
             """
+            print('Decrypting and playing video buffer. Please see video_play.log for details.')
+            chunker = self.read_chunks(index, chunk_size=10**5)
+            video.play_buffer(lambda: next(chunker))
 
 
 if __name__ == '__main__':
-    v = Vault.new('password', 'test.vault')
-    v.store_item(b'secret sauce')
-    v.store_streamable_video('nge_op.mkv')
-    v.export_item_to_file(1, 'nge_op_recovered.mkv')
-    print(v.ls())
+    MODE = 'both'
+
+    if MODE in ('write', 'both'):
+        v = Vault.new('test.vault', 'password')
+        v.store_item(b'secret')
+        v.store_file('sus_image.png')
+        v.store_streamable_video('nge_op.mkv', preset='ultrafast')
+        print(v.ls())
+        v.close()
+
+    if MODE in ('read', 'both'):
+        v = Vault.from_file('test.vault', 'password')
+        print(v.ls())
+        v.disp_image(1)
+        v.disp_video(2)

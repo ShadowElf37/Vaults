@@ -1,6 +1,11 @@
-# Vaults v2.1
-Simple Python script for making and managing encrypted vaults. Vaults use a symmetrically encrypted, randomly generated AES key to encode and decode data.
+# Vaults v2.0
+Simple Python script for making and managing encrypted vaults.
+Vaults use ChaCha20 to encrypt and decrypt data from user password.
 
-Requires pycryptodome (and opencv-python if you want image display).
+Capable of encrypting images and videos and playing them back without decrypting to an external file.
+
+Requires pycryptodome.
+Requires opencv-python if you want easy image display.
+Requires ffmpeg and ffplay if you want easy video storage and playback.
 
 See bottom of vault.py for example usage.
