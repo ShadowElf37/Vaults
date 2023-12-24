@@ -15,16 +15,16 @@ class CipherGenerator:
         self.keys = self.gen_keys(password)
 
     @classmethod
-    def gen_keys(cls, pwd: str):
+    def gen_keys(cls, pwd: str) -> [bytes]:
         keys = []
         for salt in SALTS:
             hasher = SHA3_256.new(pwd.encode(ENCODING) + salt)
             for _ in range(1000):
                 hasher = SHA3_256.new(hasher.digest())
             keys.append(hasher.digest())
-        return keys
+        return tuple(keys)
     @classmethod
-    def gen_nonce(cls):
+    def gen_nonce(cls) -> bytes:
         return urandom(12)
 
     def renew(self, nonce=None):
@@ -35,11 +35,11 @@ class CipherGenerator:
 class Cipher:
     def __init__(self, ciphers):
         self.ciphers = ciphers
-    def encrypt(self, data):
+    def encrypt(self, data: bytes) -> bytes:
         for cipher in self.ciphers:
             data = cipher.encrypt(data)
         return data
-    def decrypt(self, data):
+    def decrypt(self, data: bytes) -> bytes:
         for cipher in self.ciphers:
             data = cipher.decrypt(data)
         return data

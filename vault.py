@@ -3,9 +3,12 @@ import struct
 import io
 import ciphers
 from typing import BinaryIO
+import datetime
+import time
 try:
     import cv2
     import numpy as np
+    import video
     USE_CV = True
 except ImportError:
     USE_CV = False
@@ -14,57 +17,75 @@ ENCODING = 'utf-8'
 
 class Record:
     """
-    [64 bytes] name
-    [12 bytes] data nonce
-    [8 bytes] data size
-    [8 bytes] data ptr
+    [12 bytes] record nonce
 
-    total: 92 bytes per Record
+    [12 bytes] data nonce
+    [64 bytes] name
+    [8 bytes] data size
+    [8 bytes] timestamp
+
+    total: 12 + 92 bytes per Record
     """
 
-    FMT = '<64s12sQQ'
-    SIZE = struct.calcsize(FMT)
+    FMT = '<12s64sQq'
+    RECORD_SIZE = struct.calcsize(FMT)
+    FULL_SIZE = RECORD_SIZE + 12
 
-    def __init__(self, name, nonce, data_size, data_ptr):
-        self.name = name
+    def __init__(self, rec_nonce, nonce, name, data_size, timestamp):
+        self.rec_nonce = rec_nonce
         self.nonce = nonce
+        self.name = name.strip(b'\x00')
         self.data_size = data_size
-        self.data_ptr = data_ptr
+        self.timestamp = int(timestamp)
+        self.data_ptr = 0
 
     def __repr__(self):
-        return str((self.name, self.nonce, self.data_size, self.data_ptr))
+        return 'Record'+str((self.rec_nonce, self.nonce, self.name, self.data_size, self.timestamp))
+
+    def delete(self):
+        self.name = b''
+        self.timestamp = int(time.time())
+
+    @property
+    def dt(self):
+        return datetime.datetime.fromtimestamp(self.timestamp).strftime(r'%Y-%m-%d %H:%M:%S')
 
     @staticmethod
-    def load(buffer: bytes):
-        return Record(*struct.unpack(Record.FMT, buffer))
-    def dump(self) -> bytes:
-        return struct.pack(Record.FMT, self.name, self.nonce, self.data_size, self.data_ptr)
+    def load(buffer: BinaryIO, rec_nonce: bytes, cipher_gen: ciphers.CipherGenerator):
+        cipher = cipher_gen.renew(rec_nonce)
+        rec = Record(rec_nonce, *struct.unpack(Record.FMT, cipher.decrypt(buffer.read(Record.RECORD_SIZE))))
+        rec.data_ptr = buffer.tell()
+        return rec
+    def dump(self, cipher_gen: ciphers.CipherGenerator) -> bytes:
+        cipher = cipher_gen.renew(self.rec_nonce)
+        return self.rec_nonce + cipher.encrypt(struct.pack(Record.FMT, self.nonce, self.name, self.data_size, self.timestamp))
 
 
 class Vault:
-    MAX_ENTRIES = 128
+    """
+    Data:
+    [Record] [Data]
+    """
 
     @staticmethod
-    def new(password: str, buffer: BinaryIO = io.BytesIO()):
-        v = Vault(password, buffer, Vault.MAX_ENTRIES)
-        buffer.write(v.__record_nonce)
-        buffer.write(bytes(Vault.MAX_ENTRIES*Record.SIZE))
-        return v
+    def new(password: str, fp: str):
+        buffer = open(fp, 'wb+')
+        return Vault(password, buffer)
 
     @staticmethod
-    def from_file(buffer: BinaryIO, password: str):
-        v = Vault(password, buffer, Vault.MAX_ENTRIES)
+    def from_buffer(buffer: BinaryIO, password: str):
+        v = Vault(password, buffer)
         v.__load_record_table()
         return v
+    @staticmethod
+    def from_file(fp: str, password: str):
+        return Vault.from_buffer(open(fp, 'rb+'), password)
 
-    def __init__(self, password: str, buffer: BinaryIO, max_entries):
+    def __init__(self, password: str, buffer: BinaryIO = io.BytesIO()):
         if not (buffer.readable() and buffer.writable()):
             raise IOError('Buffer must have read/write perms')
 
-        self.__record_nonce = os.urandom(12)
         self.records: [Record] = []
-        self.max_entries = Vault.MAX_ENTRIES
-        self.__data_start = self.max_entries * Record.SIZE + 12
         self.buffer = buffer
         self.__cipher = ciphers.CipherGenerator(password)
 
@@ -72,33 +93,18 @@ class Vault:
         pass
     def __exit__(self, *args):
         self.buffer.close()
+        self.__cipher = None
 
     def __load_record_table(self):
         self.buffer.seek(0)
-        self.__record_nonce = self.buffer.read(12)
-        cipher = self.__cipher.renew(self.__record_nonce)
-        while True:
-            data = self.buffer.read(Record.SIZE)
-            data = cipher.decrypt(data)
-            if not any(data):
-                break
-            self.records.append(Record.load(data))
-    def __dump_record_table(self):
-        cipher = self.__cipher.renew(self.__record_nonce)
-        self.buffer.seek(12)
-        zeros = bytes(Record.SIZE)
-        for i in range(self.max_entries):
-            if i < self.count:
-                self.buffer.write(cipher.encrypt(self.records[i].dump()))
-            else:
-                self.buffer.write(cipher.encrypt(zeros))
+        while rec_nonce := self.buffer.read(12):
+            rec = Record.load(self.buffer, rec_nonce, self.__cipher)
+            self.buffer.seek(rec.data_ptr + rec.data_size)
+            self.records.append(rec)
 
-    def __write_raw(self, data: bytes):
-        self.buffer.seek(self.__data_start + self.data_size)
-        self.buffer.write(data)
     def __chunk_read_raw(self, rec: Record, chunk_size=1024) -> bytes:
         for i in range(0, rec.data_size, chunk_size):
-            self.buffer.seek(self.__data_start + rec.data_ptr + i)
+            self.buffer.seek(rec.data_ptr + i)
             yield self.buffer.read(min(chunk_size, rec.data_size - i))
     def read_chunks(self, index: int, chunk_size=1024) -> bytes:
         """
@@ -116,18 +122,27 @@ class Vault:
         """
         return sum(rec.data_size for rec in self.records)
     @property
+    def record_size(self):
+        """
+        Total bytes of records only
+        """
+        return self.count * Record.FULL_SIZE
+    @property
     def count(self):
         """
         Number of entries
         """
         return len(self.records)
+    @property
+    def buffer_end(self):
+        return self.count * Record.FULL_SIZE + self.data_size
 
     def ls(self):
         """
         Return a nice summary of the vault contents
         """
-        return ('Vault with %d entries (%.1f kB):' % (self.count, (self.__data_start + self.data_size) / 1000)) + ''.join(
-            ['\n%d\t• %s  (%d B)' % (i, rec.name.decode(ENCODING), rec.data_size) for i, rec in enumerate(self.records)]
+        return ('Vault with %d entries (%.1f kB):' % (self.count, (self.record_size + self.data_size) / 1000)) + ''.join(
+            ['\n%d\t• %s  (%d B) (%s)' % (i, rec.name.decode(ENCODING), rec.data_size, rec.dt) for i, rec in enumerate(self.records)]
         ) + '\n'
 
     def store_item(self, data: str | bytes, name='Unnamed Data'):
@@ -139,18 +154,36 @@ class Vault:
         if type(data) is str:
             data = data.encode(ENCODING)
 
-        rec = Record(name, os.urandom(12), len(data), self.data_size)
-        cipher = self.__cipher.renew(rec.nonce)
-        self.__write_raw(cipher.encrypt(data))
-
+        rec = Record(os.urandom(12), os.urandom(12), name, len(data), time.time())
+        self.buffer.seek(self.buffer_end)
+        self.buffer.write(rec.dump(self.__cipher))
+        rec.data_ptr = self.buffer.tell()
         self.records.append(rec)
-        self.__dump_record_table()
 
-    def store_file(self, fp:str):
+        cipher = self.__cipher.renew(rec.nonce)
+        self.buffer.write(cipher.encrypt(data))
+
+    def store_from_buffer(self, buffer: BinaryIO, name='Unnamed Data', chunk_size=10**7):
         """
-        Stores a whole file.
+        Main function for writing data, encrypted
         """
-        self.store_item(open(fp, 'rb').read(), os.path.split(fp)[-1])
+        if type(name) is str:
+            name = name.encode(ENCODING)
+
+        record_start = self.buffer_end
+
+        self.buffer.seek(record_start+Record.FULL_SIZE)
+        nonce = os.urandom(12)
+        cipher = self.__cipher.renew(nonce)
+        bytes_written = 0
+        while data := buffer.read(chunk_size):
+            bytes_written += self.buffer.write(cipher.encrypt(data))
+
+        rec = Record(os.urandom(12), nonce, name, bytes_written, time.time())
+        self.buffer.seek(record_start)
+        self.buffer.write(rec.dump(self.__cipher))
+        rec.data_ptr = record_start+Record.FULL_SIZE
+        self.records.append(rec)
 
     def read_item(self, index: int):
         """
@@ -158,9 +191,17 @@ class Vault:
         """
 
         rec = self.records[index]
-        self.buffer.seek(self.__data_start + rec.data_ptr)
+        self.buffer.seek(rec.data_ptr)
         cipher = self.__cipher.renew(rec.nonce)
         return cipher.decrypt(self.buffer.read(rec.data_size))
+
+    def store_file(self, fp: str):
+        """
+        Stores a whole file.
+        """
+        with open(fp, 'rb') as f:
+            self.store_from_buffer(f, os.path.split(fp)[-1])
+
 
     def read_all(self):
         """
@@ -168,12 +209,15 @@ class Vault:
         """
         return [self.read_item(i) for i in range(self.count)]
 
-    def write_item_to_file(self, index: int, fp: str):
+    def export_item_to_file(self, index: int, fp: str):
         """
         Exports an item, DECRYPTED
         """
+        print('Exporting %.1f MB...' % (self.records[index].data_size/1000000), end=' ')
         with open(fp, 'wb') as f:
-            f.write(self.read_item(index))
+            for chunk in self.read_chunks(index, chunk_size=10**7):
+                f.write(chunk)
+        print('done!')
 
     def close(self):
         self.buffer.close()
@@ -192,6 +236,24 @@ class Vault:
             cv2.waitKey(0)
             cv2.destroyAllWindows()
 
+        def store_streamable_video(self, fp: str):
+            t = time.time()
+            print('Storing video (%.1f MB), this may take a while...' % (os.path.getsize(fp)/1000000), end='')
+            name = os.path.split(fp)[-1]
+            record_start = self.buffer_end
+
+            nonce = os.urandom(12)
+            cipher = self.__cipher.renew(nonce)
+            self.buffer.seek(record_start + Record.FULL_SIZE)
+            bytes_written = video.stream_h264_into_buffer(fp, lambda data: self.buffer.write(cipher.encrypt(data)))
+            print('done in %.1f! (-> %.1f MB)' % (time.time()-t, bytes_written/1000000))
+
+            rec = Record(os.urandom(12), nonce, name.encode(ENCODING), bytes_written, time.time())
+            self.buffer.seek(record_start)
+            self.buffer.write(rec.dump(self.__cipher))
+            rec.data_ptr = record_start + Record.FULL_SIZE
+            self.records.append(rec)
+
         def disp_video(self, index: int):
             """
             Displays a video without saving it to a file
@@ -199,13 +261,8 @@ class Vault:
 
 
 if __name__ == '__main__':
-    file = open('test.vault2', 'rb+')
-
-    v = Vault.new('password', file)
+    v = Vault.new('password', 'test.vault')
     v.store_item(b'secret sauce')
-    v.store_file('sus_image.png')
+    v.store_streamable_video('nge_op.mkv')
+    v.export_item_to_file(1, 'nge_op_recovered.mkv')
     print(v.ls())
-    v.close()
-    v = Vault.from_file(open('test.vault2', 'rb+'), 'password')
-    v.disp_image(1)
-    v.close()
