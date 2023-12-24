@@ -6,6 +6,7 @@ from typing import BinaryIO, Generator, Iterable
 import datetime
 import time
 import shutil
+import getpass
 try:
     import cv2
     import numpy as np
@@ -76,25 +77,31 @@ class Vault:
     """
 
     @staticmethod
-    def new(fp: str, password: str):
+    def new(fp: str, password: str=None):
         """
         Make new vault at fp
         """
+        if password is None:
+            password = getpass.getpass('Password: ')
         return Vault(password, open(fp, 'wb+'))
 
     @staticmethod
-    def from_buffer(buffer: BinaryIO, password: str):
+    def from_buffer(buffer: BinaryIO, password: str=None):
         """
         Read vault from any buffer
         """
+        if password is None:
+            password = getpass.getpass('Password: ')
         v = Vault(password, buffer)
         v.__load_record_table()
         return v
     @staticmethod
-    def from_file(fp: str, password: str):
+    def from_file(fp: str, password: str=None):
         """
         Open vault file
         """
+        if password is None:
+            password = getpass.getpass('Password: ')
         return Vault.from_buffer(open(fp, 'rb+'), password)
 
     def __init__(self, password: str, buffer: BinaryIO = io.BytesIO()):
@@ -112,6 +119,9 @@ class Vault:
         pass
     def __exit__(self, *args):
         self.close()
+
+    def __repr__(self):
+        return self.ls()
 
     def __load_record_table(self):
         self.buffer.seek(0)
@@ -166,6 +176,8 @@ class Vault:
         return ('Vault with %d entries (%.1f kB):' % (self.count, (self.record_size + self.data_size) / 1000)) + ''.join(
             ['\n%d\t• %s (%d B) (%s)' % (i, rec.name.decode(ENCODING), rec.data_size, rec.dt) for i, rec in enumerate(self.records)]
         ) + '\n'
+    def pls(self):
+        print(self.ls())
 
     def store_item(self, data: str | bytes, name='Unnamed Data'):
         """
@@ -303,7 +315,8 @@ if __name__ == '__main__':
         v = Vault.new('test.vault', 'password')
         v.store_item(b'secret')
         v.store_file('sus_image.png')
-        v.store_streamable_video('nge_op.mkv', preset='ultrafast')
+        FP = r'D:\Anime\Evangelion\[Fussoir][Neon Genesis Evangelion][1080P]\Neon Genesis Evangelion - OP - 1080p Hi10p [6B1E397E].mkv'
+        v.store_streamable_video(FP)
         print(v.ls())
         v.close()
 
