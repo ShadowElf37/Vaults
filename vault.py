@@ -200,7 +200,7 @@ class Vault:
 
     def store_from_buffer(self, buffer: BinaryIO, name='Unnamed Data', chunk_size=10**7):
         """
-        Main function for writing data, encrypted
+        Function for writing data from a buffer, encrypted
         """
         if type(name) is str:
             name = name.encode(ENCODING)
