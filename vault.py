@@ -2,7 +2,7 @@ import os
 import struct
 import io
 import ciphers
-from typing import BinaryIO, Generator, Iterable
+from typing import BinaryIO, Generator, Iterable, Callable
 import datetime
 import time
 import shutil
@@ -130,19 +130,6 @@ class Vault:
             self.buffer.seek(rec.data_ptr + rec.data_size)
             self.records.append(rec)
 
-    def __chunk_read_raw(self, rec: Record, chunk_size=1024) -> bytes:
-        for i in range(0, rec.data_size, chunk_size):
-            self.buffer.seek(rec.data_ptr + i)
-            yield self.buffer.read(min(chunk_size, rec.data_size - i))
-    def read_chunks(self, index: int, chunk_size=1024) -> Generator[bytes, None, None]:
-        """
-        Generator that returns chunks of data from a file index
-        """
-        rec = self.records[index]
-        cipher = self.__cipher.renew(rec.nonce)
-        for chunk in self.__chunk_read_raw(rec, chunk_size):
-            yield cipher.decrypt(chunk)
-
     @property
     def data_size(self):
         """
@@ -179,28 +166,11 @@ class Vault:
     def pls(self):
         print(self.ls())
 
-    def store_item(self, data: str | bytes, name='Unnamed Data'):
-        """
-        Main function for writing data, encrypted
-        """
-        if type(name) is str:
-            name = name.encode(ENCODING)
-        if type(data) is str:
-            data = data.encode(ENCODING)
 
-        rec = Record(os.urandom(12), os.urandom(12), name, len(data), time.time())
-        self.buffer.seek(self.buffer_end)
-        self.buffer.write(rec.dump(self.__cipher))
-        self.buffer.flush()
-        rec.data_ptr = self.buffer.tell()
-        self.records.append(rec)
-
-        cipher = self.__cipher.renew(rec.nonce)
-        self.buffer.write(cipher.encrypt(data))
-
-    def store_from_buffer(self, buffer: BinaryIO, name='Unnamed Data', chunk_size=10**7):
+    # ========== STORAGE FUNCTIONS ==========
+    def store_chunks(self, chunks: Iterable, name='Unnamed Data'):
         """
-        Function for writing data from a buffer, encrypted
+        Function for writing data from chunks iterable, encrypted
         """
         if type(name) is str:
             name = name.encode(ENCODING)
@@ -211,8 +181,8 @@ class Vault:
         nonce = os.urandom(12)
         cipher = self.__cipher.renew(nonce)
         bytes_written = 0
-        while data := buffer.read(chunk_size):
-            bytes_written += self.buffer.write(cipher.encrypt(data))
+        for chunk in chunks:
+            bytes_written += self.buffer.write(cipher.encrypt(chunk))
 
         rec = Record(os.urandom(12), nonce, name, bytes_written, time.time())
         self.buffer.seek(record_start)
@@ -220,38 +190,62 @@ class Vault:
         self.buffer.flush()
         rec.data_ptr = record_start+Record.FULL_SIZE
         self.records.append(rec)
-
-    def read_item(self, index: int):
+    def store_item(self, data: str | bytes, name='Unnamed Data'):
         """
-        Main function for reading data, decrypted
+        Main function for writing data, encrypted
         """
+        if type(data) is str:
+            data = data.encode(ENCODING)
 
-        rec = self.records[index]
-        self.buffer.seek(rec.data_ptr)
-        cipher = self.__cipher.renew(rec.nonce)
-        return cipher.decrypt(self.buffer.read(rec.data_size))
-
+        self.store_chunks((data,), name=name)
+    def store_from_buffer(self, buffer: BinaryIO, name='Unnamed Data', chunk_size=10**7):
+        """
+        Function for writing data from a buffer, encrypted
+        """
+        return self.store_chunks(iter(lambda: buffer.read(chunk_size), b''), name=name)
     def store_file(self, fp: str):
         """
         Stores a whole file.
         """
         with open(fp, 'rb') as f:
             self.store_from_buffer(f, os.path.split(fp)[-1])
+    def copy(self, other_vault, *indices):
+        """
+        Copies entries from another vault
+        """
+        for index in indices:
+            self.store_chunks(other_vault.read_chunks(index))
 
-
+    # ========== RETRIEVAL FUNCTIONS =========+
+    def read_chunks(self, index: int, chunk_size=10**7) -> Generator[bytes, None, None]:
+        """
+        Generator that returns chunks of data from a file index
+        """
+        rec = self.records[index]
+        cipher = self.__cipher.renew(rec.nonce)
+        for i in range(0, rec.data_size, chunk_size):
+            self.buffer.seek(rec.data_ptr + i)
+            yield cipher.decrypt(self.buffer.read(min(chunk_size, rec.data_size - i)))
+    def read_item(self, index: int):
+        """
+        Main function for reading data, decrypted
+        """
+        rec = self.records[index]
+        self.buffer.seek(rec.data_ptr)
+        cipher = self.__cipher.renew(rec.nonce)
+        return cipher.decrypt(self.buffer.read(rec.data_size))
     def read_all(self):
         """
-        Reads everything from vault, decrypted.
+        Reads everything from vault, decrypted
         """
         return [self.read_item(i) for i in range(self.count)]
-
     def export_item_to_file(self, index: int, fp: str):
         """
         Exports an item to file, DECRYPTED
         """
         print('Exporting %.1f MB...' % (self.records[index].data_size/1000000), end=' ')
         with open(fp, 'wb') as f:
-            for chunk in self.read_chunks(index, chunk_size=10**7):
+            for chunk in self.read_chunks(index):
                 f.write(chunk)
         print('done!')
 
@@ -299,12 +293,12 @@ class Vault:
             rec.data_ptr = record_start + Record.FULL_SIZE
             self.records.append(rec)
 
-        def disp_video(self, index: int):
+        def play_video(self, index: int):
             """
             Displays a video without saving it to a file
             """
             print('Decrypting and playing video buffer. Please see video_play.log for details.')
-            chunker = self.read_chunks(index, chunk_size=10**5)
+            chunker = self.read_chunks(index, chunk_size=10**6)
             video.play_buffer(lambda: next(chunker))
 
 
@@ -324,4 +318,4 @@ if __name__ == '__main__':
         v = Vault.from_file('test.vault', 'password')
         print(v.ls())
         v.disp_image(1)
-        v.disp_video(2)
+        v.play_video(2)
