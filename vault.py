@@ -83,6 +83,8 @@ class Vault:
         """
         if password is None:
             password = getpass.getpass('Password: ')
+        if os.path.exists(fp):
+            raise FileExistsError('Something already exists at that location. Overwriting is not permitted.')
         return Vault(password, open(fp, 'wb+'))
 
     @staticmethod
