@@ -12,24 +12,28 @@ try:
     import numpy as np
     USE_CV = True
 except ImportError:
-    print('WARNING: You are missing either opencv-python or numpy. Cannot display images directly. You can always manually store and load the file.')
+    print('WARNING: You are missing either opencv-python or numpy. Cannot display images directly. You can always manually store and load files yourself.')
     USE_CV = False
 
 if shutil.which('ffmpeg') and shutil.which('ffplay'):
     import video
     USE_FFMPEG = True
 else:
-    print('WARNING: You are missing either ffmpeg or ffplay. Cannot store/display videos directly. You can always manually store and load the file.')
+    print('WARNING: You are missing either ffmpeg or ffplay. Cannot store/display videos directly. You can always manually store and load files yourself.')
     USE_FFMPEG = False
 
 ENCODING = 'utf-8'
 
 
 class Record:
-    """
-    [12 bytes] record nonce
 
-    [12 bytes] data nonce
+    """
+    Records contain information about the contents of the vault and how to decrypt them.
+    They do not contain any of the actual content, encrypted or otherwise.
+
+    [12 bytes] record nonce (to encrypt the rest of the record)
+
+    [12 bytes] data nonce (to encrypt the data pointed to by the record)
     [64 bytes] name
     [8 bytes] data size
     [8 bytes] timestamp
@@ -104,7 +108,10 @@ class Vault:
         """
         if password is None:
             password = getpass.getpass('Password: ')
-        return Vault.from_buffer(open(fp, 'rb+'), password)
+        try:
+            return Vault.from_buffer(open(fp, 'rb+'), password)
+        except ValueError as e:
+            raise ValueError('ERROR: Password is incorrect, or the file is corrupted. Internal error: '+str(e))
 
     def __init__(self, password: str, buffer: BinaryIO = io.BytesIO()):
         """
@@ -211,12 +218,12 @@ class Vault:
         """
         with open(fp, 'rb') as f:
             self.store_from_buffer(f, os.path.split(fp)[-1])
-    def copy(self, other_vault, *indices):
+    def copy(self, other_vault, indices, new_names):
         """
-        Copies entries from another vault
+        Copies entries from another vault into this vault
         """
-        for index in indices:
-            self.store_chunks(other_vault.read_chunks(index))
+        for name, index in zip(new_names, indices):
+            self.store_chunks(other_vault.read_chunks(index), name=name)
 
     # ========== RETRIEVAL FUNCTIONS =========+
     def read_chunks(self, index: int, chunk_size=10**7) -> Generator[bytes, None, None]:
@@ -302,6 +309,7 @@ class Vault:
             print('Decrypting and playing video buffer. Please see video_play.log for details.')
             chunker = self.read_chunks(index, chunk_size=10**6)
             video.play_buffer(lambda: next(chunker))
+
 
 
 if __name__ == '__main__':
